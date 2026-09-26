@@ -1,0 +1,9 @@
+# Secrets and runtime state — never commit these.
+.env
+.env.*
+state.json
+*.tmp
+
+# Python
+__pycache__/
+*.py[cod]
