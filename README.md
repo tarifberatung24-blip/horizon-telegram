@@ -7,7 +7,7 @@
 ```bash
 git clone https://github.com/tarifberatung24-blip/horizon-telegram.git
 cd horizon-telegram
-./setup.sh
+bash setup.sh
 ```
 
 Това е. Скриптът ще те пита за 2 неща (скрито, никой не ги вижда):
@@ -64,14 +64,14 @@ sudo systemctl enable --now horizon-telegram
 ## Сигурност
 
 - Ботът отговаря само на `2065255514`. Другите получават „Not authorized."
-- Токенът е само в `.env` (само ти можеш да го четеш). Никога не влиза в логове.
+- Токенът е само в `.env` (само ти можеш да го четеш, `.gitignore` го пази от commit). Никога не влиза в логове.
 - Не иска и не пази пароли, PIN, TAN, OTP.
 
 ## Ако не тръгне
 
 | Съобщение | Какво значи |
 |---|---|
-| `refusing to start: TELEGRAM_BOT_TOKEN is required` | не си дал токен — пусни `./setup.sh` пак |
+| `refusing to start: TELEGRAM_BOT_TOKEN is required` | не си дал токен — пусни `bash setup.sh` пак |
 | `HTTP Error 401: Unauthorized` | грешен Telegram токен |
 | `HTTP Error 401` от OpenHands | грешен OpenHands ключ |
 | Ботът мълчи | виж `journalctl -u horizon-telegram -f` |
