@@ -385,19 +385,25 @@ def build_backend(config: Config) -> Backend:
 
 
 def extract_agent_text(event: dict[str, Any]) -> str | None:
-    """Pull the text out of an assistant MessageEvent, or None.
+    """Pull the text out of an agent MessageEvent, or None.
 
-    The event shape varies a little by server version, so several plausible
-    locations are tried rather than assuming one.
+    Verified against the live API: an agent reply is a MessageEvent whose
+    `source` is "agent" (not "assistant"), and the text sits in
+    `llm_message.content`. `reasoning_content` is deliberately ignored: it is the
+    model's private thinking, not the answer to show the user.
     """
     if event.get("kind") != "MessageEvent":
         return None
-    if event.get("source") != "assistant":
+    if event.get("source") not in ("agent", "assistant"):
         return None
 
-    message = event.get("message") or event.get("llm_message") or {}
-    content = message.get("content") if isinstance(message, dict) else message
+    message = event.get("llm_message") or event.get("message") or {}
+    if not isinstance(message, dict):
+        return None
+    if message.get("role") not in (None, "assistant"):
+        return None
 
+    content = message.get("content")
     if isinstance(content, str):
         return content or None
     if isinstance(content, list):

@@ -443,54 +443,79 @@ class TestPreflightAgainstRealServer(ServerCase):
 
 
 class TestAgentReplyExtraction(unittest.TestCase):
-    def test_reads_a_plain_assistant_message(self) -> None:
+    """Shapes copied from a real event fetched from the live API."""
+
+    def test_reads_a_real_agent_message(self) -> None:
+        import bridge as m
+
+        # Trimmed from GET /api/v1/conversation/{id}/events/search.
+        event = {
+            "id": "edc83da5-eaf0-415d-b2b6-808b96483666",
+            "timestamp": "2026-09-27T00:25:13.812117",
+            "source": "agent",
+            "kind": "MessageEvent",
+            "llm_message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "Hallo — womit soll ich anfangen?"}],
+                "reasoning_content": "the user is frustrated",
+            },
+        }
+        self.assertEqual(m.extract_agent_text(event), "Hallo — womit soll ich anfangen?")
+
+    def test_never_leaks_the_models_private_reasoning(self) -> None:
         import bridge as m
 
         event = {
+            "source": "agent",
             "kind": "MessageEvent",
-            "source": "assistant",
-            "message": {"content": [{"type": "text", "text": "Done."}]},
+            "llm_message": {"role": "assistant", "content": [], "reasoning_content": "secret plan"},
         }
-        self.assertEqual(m.extract_agent_text(event), "Done.")
+        self.assertIsNone(m.extract_agent_text(event))
 
     def test_ignores_user_and_tool_events(self) -> None:
         import bridge as m
 
         self.assertIsNone(m.extract_agent_text({"kind": "MessageEvent", "source": "user",
-                                                "message": {"content": [{"text": "hi"}]}}))
+                                                "llm_message": {"content": [{"text": "hi"}]}}))
         self.assertIsNone(m.extract_agent_text({"kind": "ActionEvent", "source": "agent",
                                                 "tool_name": "terminal"}))
         self.assertIsNone(m.extract_agent_text({"kind": "ObservationEvent", "source": "environment"}))
+        self.assertIsNone(m.extract_agent_text({"kind": "ConversationStateUpdateEvent",
+                                                "source": "environment"}))
+
+    def test_ignores_a_non_assistant_role(self) -> None:
+        import bridge as m
+
+        event = {"kind": "MessageEvent", "source": "agent",
+                 "llm_message": {"role": "user", "content": [{"text": "echo"}]}}
+        self.assertIsNone(m.extract_agent_text(event))
 
     def test_handles_a_string_content(self) -> None:
         import bridge as m
 
-        event = {"kind": "MessageEvent", "source": "assistant", "message": {"content": "plain"}}
+        event = {"kind": "MessageEvent", "source": "agent", "llm_message": {"content": "plain"}}
         self.assertEqual(m.extract_agent_text(event), "plain")
 
-    def test_handles_content_without_a_message_wrapper(self) -> None:
+    def test_handles_legacy_assistant_shape(self) -> None:
         import bridge as m
 
-        event = {"kind": "MessageEvent", "source": "assistant", "llm_message": {"content": "x"}}
-        self.assertEqual(m.extract_agent_text(event), "x")
+        event = {"kind": "MessageEvent", "source": "assistant", "message": {"content": "old"}}
+        self.assertEqual(m.extract_agent_text(event), "old")
 
-    def test_empty_assistant_message_is_ignored(self) -> None:
+    def test_empty_agent_message_is_ignored(self) -> None:
         import bridge as m
 
-        event = {"kind": "MessageEvent", "source": "assistant", "message": {"content": []}}
+        event = {"kind": "MessageEvent", "source": "agent", "llm_message": {"content": []}}
         self.assertIsNone(m.extract_agent_text(event))
 
     def test_collect_drops_already_seen_and_keeps_order(self) -> None:
         import bridge as m
 
-        events = [
-            {"id": "b", "timestamp": "2", "kind": "MessageEvent", "source": "assistant",
-             "message": {"content": [{"text": "second"}]}},
-            {"id": "a", "timestamp": "1", "kind": "MessageEvent", "source": "assistant",
-             "message": {"content": [{"text": "first"}]}},
-            {"id": "a", "timestamp": "1", "kind": "MessageEvent", "source": "assistant",
-             "message": {"content": [{"text": "first"}]}},
-        ]
+        def msg(eid, ts, text, source="agent"):
+            return {"id": eid, "timestamp": ts, "kind": "MessageEvent", "source": source,
+                    "llm_message": {"role": "assistant", "content": [{"text": text}]}}
+
+        events = [msg("b", "2", "second"), msg("a", "1", "first"), msg("a", "1", "first")]
         seen: set[str] = set()
         self.assertEqual(m.collect_new_agent_messages(events, seen), ["first", "second"])
         # A second pass yields nothing: the ids are now known.
@@ -525,10 +550,10 @@ class TestRelayAgainstRealServer(ServerCase):
             200,
             {
                 "items": [
-                    {"id": "e1", "timestamp": "1", "kind": "MessageEvent", "source": "assistant",
-                     "message": {"content": [{"text": "Hello from the agent"}]}},
+                    {"id": "e1", "timestamp": "1", "kind": "MessageEvent", "source": "agent",
+                     "llm_message": {"role": "assistant", "content": [{"text": "Hello from the agent"}]}},
                     {"id": "u1", "timestamp": "0", "kind": "MessageEvent", "source": "user",
-                     "message": {"content": [{"text": "hi"}]}},
+                     "llm_message": {"role": "user", "content": [{"text": "hi"}]}},
                 ]
             },
         )
