@@ -325,10 +325,19 @@ class TestRouting(unittest.TestCase):
         reply = handle_command("/status", chat_id=1, user_id=7, state=state, backend=backend)
         self.assertIn("No conversation", reply.text)
 
-    def test_new_without_text_is_usage(self) -> None:
+    def test_new_alone_clears_the_conversation(self) -> None:
         state, backend = self.make()
+        state.conversations["1:7"] = "conv-old"
         reply = handle_command("/new", chat_id=1, user_id=7, state=state, backend=backend)
-        self.assertIn("Usage", reply.text)
+        self.assertIn("Cleared", reply.text)
+        self.assertNotIn("1:7", state.conversations)
+        self.assertEqual(backend.started, [])
+
+    def test_new_with_text_starts_immediately(self) -> None:
+        state, backend = self.make()
+        reply = handle_command("/new hello agent", chat_id=1, user_id=7, state=state, backend=backend)
+        self.assertIn("Started", reply.text)
+        self.assertEqual(backend.started, ["hello agent"])
 
 
 class TestUpdateAuthorization(unittest.TestCase):
@@ -564,6 +573,82 @@ class TestRelayAgainstRealServer(ServerCase):
             m.relay_agent_replies(state=state, backend=m.CloudBackend(config), telegram=telegram), 0
         )
         self.assertEqual(telegram.sent, [])
+
+
+class TestRecordNormalization(unittest.TestCase):
+    """The API returns a bare list in some deployments; that crashed the bridge."""
+
+    def test_a_bare_list_is_accepted(self) -> None:
+        import bridge as m
+
+        payload = [{"app_conversation_id": "conv-1"}]
+        self.assertEqual(m.records_of(payload), payload)
+        self.assertEqual(m.first_record(payload)["app_conversation_id"], "conv-1")
+
+    def test_items_wrapper_is_accepted(self) -> None:
+        import bridge as m
+
+        payload = {"items": [{"app_conversation_id": "conv-2"}]}
+        self.assertEqual(m.records_of(payload), [{"app_conversation_id": "conv-2"}])
+
+    def test_a_single_object_is_accepted(self) -> None:
+        import bridge as m
+
+        self.assertEqual(m.records_of({"id": "x"}), [{"id": "x"}])
+
+    def test_empty_and_none_are_safe(self) -> None:
+        import bridge as m
+
+        self.assertEqual(m.records_of(None), [])
+        self.assertEqual(m.records_of([]), [])
+        self.assertEqual(m.records_of({"items": []}), [])
+        self.assertEqual(m.first_record(None), {})
+
+    def test_non_dict_entries_are_dropped(self) -> None:
+        import bridge as m
+
+        self.assertEqual(m.records_of(["nope", {"id": "ok"}]), [{"id": "ok"}])
+
+
+class TestCloudStartAgainstRealServer(ServerCase):
+    def config(self) -> Config:
+        return Config(
+            telegram_token="t",
+            allowed_user_ids=frozenset({1}),
+            mode="cloud",
+            state_file="/tmp/unused",
+            cloud_api_key="k",
+            cloud_base_url=self.base(),
+        )
+
+    def test_start_accepts_a_bare_list_response(self) -> None:
+        import bridge as m
+
+        self.server.responders["/api/v1/app-conversations"] = lambda e: (
+            200, [{"app_conversation_id": "conv-list"}]
+        )
+        self.assertEqual(m.CloudBackend(self.config()).start("hello"), "conv-list")
+
+    def test_start_accepts_a_start_task_and_polls_it(self) -> None:
+        import bridge as m
+
+        def create(e):
+            return 200, [{"id": "task-1"}]
+
+        def poll(e):
+            return 200, {"items": [{"app_conversation_id": "conv-polled"}]}
+
+        self.server.responders["/api/v1/app-conversations"] = create
+        self.server.responders["/api/v1/app-conversations/start-tasks?ids=task-1"] = poll
+        self.assertEqual(m.CloudBackend(self.config()).start("hello"), "conv-polled")
+
+    def test_status_reads_a_bare_list(self) -> None:
+        import bridge as m
+
+        self.server.responders["/api/v1/app-conversations?ids=conv-1"] = lambda e: (
+            200, [{"sandbox_status": "RUNNING", "execution_status": "running"}]
+        )
+        self.assertEqual(m.CloudBackend(self.config()).status("conv-1"), "RUNNING / running")
 
 
 class TestStatePersistence(unittest.TestCase):

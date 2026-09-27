@@ -221,6 +221,31 @@ class Telegram:
 # --------------------------------------------------------------------------- #
 
 
+def records_of(payload: Any) -> list[dict[str, Any]]:
+    """Normalize an API body to a list of records.
+
+    Some app-server versions return a bare list, others wrap it in "items", and a
+    single lookup may return one object. All three shapes appear in practice.
+    """
+    if payload is None:
+        return []
+    if isinstance(payload, list):
+        return [item for item in payload if isinstance(item, dict)]
+    if isinstance(payload, dict):
+        items = payload.get("items")
+        if isinstance(items, list):
+            return [item for item in items if isinstance(item, dict)]
+        if items is None:
+            return [payload]
+        return []
+    return []
+
+
+def first_record(payload: Any) -> dict[str, Any]:
+    records = records_of(payload)
+    return records[0] if records else {}
+
+
 class Backend:
     """What the bridge needs from an OpenHands deployment."""
 
@@ -256,11 +281,12 @@ class CloudBackend(Backend):
             payload["selected_branch"] = self._config.cloud_branch
 
         created = post_json(f"{self._config.cloud_base_url}/api/v1/app-conversations", payload, self._headers())
-        if created.get("app_conversation_id"):
-            return created["app_conversation_id"]
+        record = first_record(created)
+        if record.get("app_conversation_id"):
+            return record["app_conversation_id"]
 
         # The start endpoint is asynchronous; poll the start task for the id.
-        start_task_id = created.get("id")
+        start_task_id = record.get("id")
         if not start_task_id:
             raise RuntimeError(redact(f"unexpected start response: {created}", self._config.cloud_api_key))
         deadline = time.time() + 180
@@ -269,8 +295,7 @@ class CloudBackend(Backend):
                 f"{self._config.cloud_base_url}/api/v1/app-conversations/start-tasks?ids={start_task_id}",
                 self._headers(),
             )
-            items = task.get("items") or ([task] if task.get("app_conversation_id") else [])
-            for item in items:
+            for item in records_of(task):
                 if item.get("app_conversation_id"):
                     return item["app_conversation_id"]
             time.sleep(2)
@@ -288,8 +313,7 @@ class CloudBackend(Backend):
             f"{self._config.cloud_base_url}/api/v1/app-conversations?ids={conversation_id}",
             self._headers(),
         )
-        items = record.get("items") or [record]
-        item = items[0] if items else {}
+        item = first_record(record)
         return f"{item.get('sandbox_status', '?')} / {item.get('execution_status', '?')}"
 
     def fetch_events(self, conversation_id: str, limit: int = 50) -> list[dict[str, Any]]:
@@ -298,7 +322,7 @@ class CloudBackend(Backend):
             f"/events/search?limit={limit}&sort_order=TIMESTAMP_DESC",
             self._headers(),
         )
-        return result.get("items") or []
+        return records_of(result)
 
 
 class LocalAgentServerBackend(Backend):
@@ -557,7 +581,8 @@ def handle_command(
     if stripped.startswith("/new"):
         first_message = stripped[len("/new") :].strip()
         if not first_message:
-            return Reply("Usage: /new <first message>", True)
+            state.conversations.pop(key, None)
+            return Reply("Cleared. Your next message starts a fresh conversation.", True)
         conversation_id = backend.start(first_message)
         state.conversations[key] = conversation_id
         return Reply(f"Started {conversation_id}", True)
