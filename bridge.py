@@ -32,7 +32,7 @@ from typing import Any, Iterable
 
 TELEGRAM_API = "https://api.telegram.org"
 TELEGRAM_MESSAGE_LIMIT = 4096
-POLL_TIMEOUT_SECONDS = 30
+POLL_TIMEOUT_SECONDS = 10
 HTTP_TIMEOUT_SECONDS = 60
 
 
@@ -233,6 +233,9 @@ class Backend:
     def status(self, conversation_id: str) -> str:
         raise NotImplementedError
 
+    def fetch_events(self, conversation_id: str, limit: int = 50) -> list[dict[str, Any]]:
+        raise NotImplementedError
+
 
 class CloudBackend(Backend):
     """OpenHands Cloud app-server API. Bearer auth, async start."""
@@ -289,6 +292,14 @@ class CloudBackend(Backend):
         item = items[0] if items else {}
         return f"{item.get('sandbox_status', '?')} / {item.get('execution_status', '?')}"
 
+    def fetch_events(self, conversation_id: str, limit: int = 50) -> list[dict[str, Any]]:
+        result = get_json(
+            f"{self._config.cloud_base_url}/api/v1/conversation/{conversation_id}"
+            f"/events/search?limit={limit}&sort_order=TIMESTAMP_DESC",
+            self._headers(),
+        )
+        return result.get("items") or []
+
 
 class LocalAgentServerBackend(Backend):
     """A local agent server inside the sandbox, e.g. Agent Canvas on :8000."""
@@ -331,9 +342,72 @@ class LocalAgentServerBackend(Backend):
         )
         return str(record.get("execution_status") or record.get("status") or "?")
 
+    def fetch_events(self, conversation_id: str, limit: int = 50) -> list[dict[str, Any]]:
+        result = get_json(
+            f"{self._config.local_agent_server_url}/api/conversations/{conversation_id}"
+            f"/events/search?limit={limit}&sort_order=TIMESTAMP_DESC",
+            self._headers(),
+        )
+        return result.get("items") or []
+
 
 def build_backend(config: Config) -> Backend:
     return CloudBackend(config) if config.mode == "cloud" else LocalAgentServerBackend(config)
+
+
+# --------------------------------------------------------------------------- #
+# Reading the agent's replies back
+# --------------------------------------------------------------------------- #
+
+
+def extract_agent_text(event: dict[str, Any]) -> str | None:
+    """Pull the text out of an assistant MessageEvent, or None.
+
+    The event shape varies a little by server version, so several plausible
+    locations are tried rather than assuming one.
+    """
+    if event.get("kind") != "MessageEvent":
+        return None
+    if event.get("source") != "assistant":
+        return None
+
+    message = event.get("message") or event.get("llm_message") or {}
+    content = message.get("content") if isinstance(message, dict) else message
+
+    if isinstance(content, str):
+        return content or None
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, dict) and item.get("text"):
+                parts.append(str(item["text"]))
+            elif isinstance(item, str):
+                parts.append(item)
+        return "\n".join(parts) if parts else None
+    return None
+
+
+def collect_new_agent_messages(
+    events: list[dict[str, Any]], seen: set[str]
+) -> list[str]:
+    """Return texts of assistant messages not in `seen`, and record them.
+
+    Ordering follows the timestamps when present so a burst of replies reads in
+    the order the agent produced them.
+    """
+    ordered = sorted(events, key=lambda e: str(e.get("timestamp", "")))
+    texts: list[str] = []
+    for event in ordered:
+        event_id = str(event.get("id", ""))
+        text = extract_agent_text(event)
+        if text is None:
+            continue
+        if event_id:
+            if event_id in seen:
+                continue
+            seen.add(event_id)
+        texts.append(text)
+    return texts
 
 
 # --------------------------------------------------------------------------- #
@@ -391,6 +465,7 @@ def preflight(config: Config) -> int:
 class State:
     offset: int | None = None
     conversations: dict[str, str] = field(default_factory=dict)
+    seen_events: dict[str, list[str]] = field(default_factory=dict)
 
     @classmethod
     def load(cls, path: str) -> "State":
@@ -400,6 +475,10 @@ class State:
             return cls(
                 offset=raw.get("offset"),
                 conversations={str(k): str(v) for k, v in raw.get("conversations", {}).items()},
+                seen_events={
+                    str(k): [str(i) for i in v]
+                    for k, v in raw.get("seen_events", {}).items()
+                },
             )
         except FileNotFoundError:
             return cls()
@@ -410,7 +489,16 @@ class State:
     def save(self, path: str) -> None:
         tmp = f"{path}.tmp"
         with open(tmp, "w", encoding="utf-8") as handle:
-            json.dump({"offset": self.offset, "conversations": self.conversations}, handle, indent=2)
+            json.dump(
+                {
+                    "offset": self.offset,
+                    "conversations": self.conversations,
+                    # Keep the tail only: older ids cannot reappear in a search.
+                    "seen_events": {k: v[-200:] for k, v in self.seen_events.items()},
+                },
+                handle,
+                indent=2,
+            )
         os.replace(tmp, path)
 
 
@@ -527,6 +615,45 @@ def process_update(update: dict[str, Any], *, state: State, config: Config, back
     return "Sent to the agent. Use /status to check."
 
 
+def chat_id_from_key(key: str) -> int | None:
+    """Conversation keys are "chat_id:user_id"; recover the chat to reply to."""
+    head = key.split(":", 1)[0]
+    try:
+        return int(head)
+    except ValueError:
+        return None
+
+
+def relay_agent_replies(
+    *,
+    state: State,
+    backend: Backend,
+    telegram: Telegram,
+) -> int:
+    """Fetch new assistant messages for active conversations and send them.
+
+    Derived from the stored key, so replies keep arriving after a restart without
+    the user having to send anything first. Returns how many messages were sent.
+    """
+    sent = 0
+    for key, conversation_id in list(state.conversations.items()):
+        chat_id = chat_id_from_key(key)
+        if chat_id is None:
+            continue
+        seen = set(state.seen_events.get(conversation_id, []))
+        try:
+            events = backend.fetch_events(conversation_id)
+        except Exception:
+            continue
+        texts = collect_new_agent_messages(events, seen)
+        if texts:
+            state.seen_events[conversation_id] = list(seen)
+        for text in texts:
+            telegram.send_message(chat_id, text)
+            sent += 1
+    return sent
+
+
 def main() -> int:
     try:
         config = load_config()
@@ -544,6 +671,8 @@ def main() -> int:
         return 1
 
     print(f"\nbridge: up in {config.mode} mode; allowed users: {sorted(config.allowed_user_ids)}")
+    print("Messages you send are relayed to the agent; its replies come back here.")
+
     while True:
         try:
             updates = telegram.get_updates(state.offset)
@@ -559,13 +688,19 @@ def main() -> int:
                 reply = process_update(update, state=state, config=config, backend=backend)
             except Exception as exc:
                 reply = f"Error: {redact(str(exc), config.telegram_token, config.cloud_api_key, config.local_session_api_key)}"
-            if reply:
-                chat_id = ((update.get("message") or {}).get("chat") or {}).get("id")
-                if isinstance(chat_id, int):
-                    try:
-                        telegram.send_message(chat_id, reply)
-                    except Exception as exc:
-                        print(f"bridge: send error: {redact(str(exc), config.telegram_token)}", file=sys.stderr)
+            chat_id = ((update.get("message") or {}).get("chat") or {}).get("id")
+            if reply and isinstance(chat_id, int):
+                try:
+                    telegram.send_message(chat_id, reply)
+                except Exception as exc:
+                    print(f"bridge: send error: {redact(str(exc), config.telegram_token)}", file=sys.stderr)
+
+        # Poll for the agent's answers while no user message is waiting.
+        try:
+            if relay_agent_replies(state=state, backend=backend, telegram=telegram):
+                state.save(config.state_file)
+        except Exception as exc:
+            print(f"bridge: relay error: {redact(str(exc), config.telegram_token)}", file=sys.stderr)
 
 
 if __name__ == "__main__":

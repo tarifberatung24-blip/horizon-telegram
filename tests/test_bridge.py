@@ -433,15 +433,149 @@ class TestPreflightAgainstRealServer(ServerCase):
         self.assertEqual(code, 0)
 
 
+class TestAgentReplyExtraction(unittest.TestCase):
+    def test_reads_a_plain_assistant_message(self) -> None:
+        import bridge as m
+
+        event = {
+            "kind": "MessageEvent",
+            "source": "assistant",
+            "message": {"content": [{"type": "text", "text": "Done."}]},
+        }
+        self.assertEqual(m.extract_agent_text(event), "Done.")
+
+    def test_ignores_user_and_tool_events(self) -> None:
+        import bridge as m
+
+        self.assertIsNone(m.extract_agent_text({"kind": "MessageEvent", "source": "user",
+                                                "message": {"content": [{"text": "hi"}]}}))
+        self.assertIsNone(m.extract_agent_text({"kind": "ActionEvent", "source": "agent",
+                                                "tool_name": "terminal"}))
+        self.assertIsNone(m.extract_agent_text({"kind": "ObservationEvent", "source": "environment"}))
+
+    def test_handles_a_string_content(self) -> None:
+        import bridge as m
+
+        event = {"kind": "MessageEvent", "source": "assistant", "message": {"content": "plain"}}
+        self.assertEqual(m.extract_agent_text(event), "plain")
+
+    def test_handles_content_without_a_message_wrapper(self) -> None:
+        import bridge as m
+
+        event = {"kind": "MessageEvent", "source": "assistant", "llm_message": {"content": "x"}}
+        self.assertEqual(m.extract_agent_text(event), "x")
+
+    def test_empty_assistant_message_is_ignored(self) -> None:
+        import bridge as m
+
+        event = {"kind": "MessageEvent", "source": "assistant", "message": {"content": []}}
+        self.assertIsNone(m.extract_agent_text(event))
+
+    def test_collect_drops_already_seen_and_keeps_order(self) -> None:
+        import bridge as m
+
+        events = [
+            {"id": "b", "timestamp": "2", "kind": "MessageEvent", "source": "assistant",
+             "message": {"content": [{"text": "second"}]}},
+            {"id": "a", "timestamp": "1", "kind": "MessageEvent", "source": "assistant",
+             "message": {"content": [{"text": "first"}]}},
+            {"id": "a", "timestamp": "1", "kind": "MessageEvent", "source": "assistant",
+             "message": {"content": [{"text": "first"}]}},
+        ]
+        seen: set[str] = set()
+        self.assertEqual(m.collect_new_agent_messages(events, seen), ["first", "second"])
+        # A second pass yields nothing: the ids are now known.
+        self.assertEqual(m.collect_new_agent_messages(events, seen), [])
+
+
+class TestChatIdFromKey(unittest.TestCase):
+    def test_recovers_the_chat(self) -> None:
+        import bridge as m
+
+        self.assertEqual(m.chat_id_from_key("2065255514:2065255514"), 2065255514)
+
+    def test_rejects_a_malformed_key(self) -> None:
+        import bridge as m
+
+        self.assertIsNone(m.chat_id_from_key("not-a-chat"))
+
+
+class FakeTelegram:
+    def __init__(self) -> None:
+        self.sent: list[tuple[int, str]] = []
+
+    def send_message(self, chat_id: int, text: str) -> None:
+        self.sent.append((chat_id, text))
+
+
+class TestRelayAgainstRealServer(ServerCase):
+    def test_relay_fetches_and_sends_new_agent_messages(self) -> None:
+        import bridge as m
+
+        self.server.responders["/api/v1/conversation/conv-1/events/search?limit=50&sort_order=TIMESTAMP_DESC"] = lambda e: (
+            200,
+            {
+                "items": [
+                    {"id": "e1", "timestamp": "1", "kind": "MessageEvent", "source": "assistant",
+                     "message": {"content": [{"text": "Hello from the agent"}]}},
+                    {"id": "u1", "timestamp": "0", "kind": "MessageEvent", "source": "user",
+                     "message": {"content": [{"text": "hi"}]}},
+                ]
+            },
+        )
+        config = Config(
+            telegram_token="t",
+            allowed_user_ids=frozenset({1}),
+            mode="cloud",
+            state_file="/tmp/unused",
+            cloud_api_key="cloud-key-value",
+            cloud_base_url=self.base(),
+        )
+        backend = m.CloudBackend(config)
+        telegram = FakeTelegram()
+        state = m.State(conversations={"2065255514:2065255514": "conv-1"})
+
+        sent = m.relay_agent_replies(state=state, backend=backend, telegram=telegram)
+
+        self.assertEqual(sent, 1)
+        self.assertEqual(telegram.sent, [(2065255514, "Hello from the agent")])
+        self.assertEqual(state.seen_events["conv-1"], ["e1"])
+
+        # Running again sends nothing, so the user is not spammed.
+        self.assertEqual(m.relay_agent_replies(state=state, backend=backend, telegram=telegram), 0)
+
+    def test_relay_survives_a_backend_failure(self) -> None:
+        import bridge as m
+
+        self.server.responders["/api/v1/conversation/conv-1/events/search?limit=50&sort_order=TIMESTAMP_DESC"] = lambda e: (
+            500, {"detail": "boom"}
+        )
+        config = Config(
+            telegram_token="t",
+            allowed_user_ids=frozenset({1}),
+            mode="cloud",
+            state_file="/tmp/unused",
+            cloud_api_key="k",
+            cloud_base_url=self.base(),
+        )
+        state = m.State(conversations={"1:1": "conv-1"})
+        telegram = FakeTelegram()
+        self.assertEqual(
+            m.relay_agent_replies(state=state, backend=m.CloudBackend(config), telegram=telegram), 0
+        )
+        self.assertEqual(telegram.sent, [])
+
+
 class TestStatePersistence(unittest.TestCase):
     def test_roundtrip(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "state.json")
-            state = State(offset=5, conversations={"1:7": "conv-1"})
+            state = State(offset=5, conversations={"1:7": "conv-1"}, seen_events={"conv-1": ["e1"]})
             state.save(path)
             loaded = State.load(path)
             self.assertEqual(loaded.offset, 5)
             self.assertEqual(loaded.conversations, {"1:7": "conv-1"})
+            self.assertEqual(loaded.seen_events, {"conv-1": ["e1"]})
 
     def test_corrupt_state_does_not_crash(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
