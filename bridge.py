@@ -337,6 +337,52 @@ def build_backend(config: Config) -> Backend:
 
 
 # --------------------------------------------------------------------------- #
+# Preflight
+# --------------------------------------------------------------------------- #
+
+
+def verify_telegram_token(config: Config) -> tuple[bool, str]:
+    """Ask Telegram who the bot is. Returns (ok, human message) with no secrets."""
+    try:
+        result = get_json(f"{TELEGRAM_API}/bot{config.telegram_token}/getMe", {})
+    except Exception as exc:
+        return False, f"could not reach Telegram ({redact(str(exc), config.telegram_token)})"
+    if result.get("ok"):
+        username = (result.get("result") or {}).get("username", "?")
+        return True, f"telegram ok (@{username})"
+    return False, (
+        "telegram rejected the token: "
+        f"{result.get('error_code', '?')} {result.get('description', 'unknown')}"
+    )
+
+
+def preflight(config: Config) -> int:
+    """Check the configuration before the poll loop, so failures are one clear line."""
+    problems: list[str] = []
+
+    ok, message = verify_telegram_token(config)
+    print(("  ok   " if ok else "  FAIL ") + message)
+    if not ok:
+        problems.append("telegram token")
+
+    if config.mode == "cloud":
+        try:
+            get_json(
+                f"{config.cloud_base_url}/api/v1/users/me",
+                {"Authorization": f"Bearer {config.cloud_api_key}"},
+            )
+            print("  ok   openhands cloud key accepted")
+        except Exception as exc:
+            print(f"  FAIL openhands cloud key: {redact(str(exc), config.cloud_api_key)}")
+            problems.append("openhands cloud key")
+
+    if problems:
+        print(f"\nFix the {' and '.join(problems)}, then run this again.")
+        return 1
+    return 0
+
+
+# --------------------------------------------------------------------------- #
 # State
 # --------------------------------------------------------------------------- #
 
@@ -493,7 +539,11 @@ def main() -> int:
     telegram = Telegram(config.telegram_token)
     state = State.load(config.state_file)
 
-    print(f"bridge: up in {config.mode} mode; allowed users: {sorted(config.allowed_user_ids)}")
+    print("Checking the configuration...")
+    if preflight(config) != 0:
+        return 1
+
+    print(f"\nbridge: up in {config.mode} mode; allowed users: {sorted(config.allowed_user_ids)}")
     while True:
         try:
             updates = telegram.get_updates(state.offset)

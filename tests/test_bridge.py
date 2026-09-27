@@ -361,6 +361,78 @@ class TestUpdateAuthorization(unittest.TestCase):
         self.assertEqual(reply, "Not authorized.")
 
 
+class TestPreflightAgainstRealServer(ServerCase):
+    def config(self, mode: str = "cloud") -> Config:
+        return Config(
+            telegram_token="tok",
+            allowed_user_ids=frozenset({1}),
+            mode=mode,
+            state_file="/tmp/unused",
+            cloud_api_key="cloud-key-value",
+            cloud_base_url=self.base(),
+        )
+
+    def test_reports_telegram_username_without_leaking_the_token(self) -> None:
+        self.server.responders["/bottok/getMe"] = lambda e: (
+            200, {"ok": True, "result": {"username": "horizon_bot"}}
+        )
+        import bridge as bridge_module
+
+        original = bridge_module.TELEGRAM_API
+        bridge_module.TELEGRAM_API = self.base()
+        try:
+            ok, message = bridge_module.verify_telegram_token(self.config())
+        finally:
+            bridge_module.TELEGRAM_API = original
+        self.assertTrue(ok)
+        self.assertIn("horizon_bot", message)
+
+    def test_rejects_a_bad_telegram_token(self) -> None:
+        self.server.responders["/bottok/getMe"] = lambda e: (
+            404, {"ok": False, "error_code": 404, "description": "Not Found"}
+        )
+        import bridge as bridge_module
+
+        original = bridge_module.TELEGRAM_API
+        bridge_module.TELEGRAM_API = self.base()
+        try:
+            ok, message = bridge_module.verify_telegram_token(self.config())
+        finally:
+            bridge_module.TELEGRAM_API = original
+        self.assertFalse(ok)
+        self.assertIn("404", message)
+
+    def test_preflight_fails_when_both_are_wrong(self) -> None:
+        self.server.responders["/bottok/getMe"] = lambda e: (
+            404, {"ok": False, "error_code": 404, "description": "Not Found"}
+        )
+        self.server.responders["/api/v1/users/me"] = lambda e: (401, {"detail": "nope"})
+        import bridge as bridge_module
+
+        original = bridge_module.TELEGRAM_API
+        bridge_module.TELEGRAM_API = self.base()
+        try:
+            code = bridge_module.preflight(self.config())
+        finally:
+            bridge_module.TELEGRAM_API = original
+        self.assertEqual(code, 1)
+
+    def test_preflight_passes_when_both_are_ok(self) -> None:
+        self.server.responders["/bottok/getMe"] = lambda e: (
+            200, {"ok": True, "result": {"username": "horizon_bot"}}
+        )
+        self.server.responders["/api/v1/users/me"] = lambda e: (200, {"id": "u1"})
+        import bridge as bridge_module
+
+        original = bridge_module.TELEGRAM_API
+        bridge_module.TELEGRAM_API = self.base()
+        try:
+            code = bridge_module.preflight(self.config())
+        finally:
+            bridge_module.TELEGRAM_API = original
+        self.assertEqual(code, 0)
+
+
 class TestStatePersistence(unittest.TestCase):
     def test_roundtrip(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
