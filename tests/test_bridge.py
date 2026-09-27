@@ -676,6 +676,78 @@ class TestCloudStartAgainstRealServer(ServerCase):
         self.assertEqual(m.CloudBackend(self.config()).status("conv-1"), "RUNNING / running")
 
 
+class TestCloudSendAgainstRealServer(ServerCase):
+    """send-message returns 409 while a sandbox is paused, and the message is lost."""
+
+    def config(self) -> Config:
+        return Config(
+            telegram_token="t",
+            allowed_user_ids=frozenset({1}),
+            mode="cloud",
+            state_file="/tmp/unused",
+            cloud_api_key="k",
+            cloud_base_url=self.base(),
+        )
+
+    def _running(self, e):
+        return 200, [{"sandbox_status": "RUNNING", "sandbox_id": "SB1"}]
+
+    def test_sends_the_documented_payload(self) -> None:
+        import bridge as m
+
+        self.server.responders["/api/v1/app-conversations?ids=conv-1"] = self._running
+        self.server.responders["/api/v1/app-conversations/conv-1/send-message"] = lambda e: (200, {})
+        m.CloudBackend(self.config()).send("conv-1", "hello agent")
+
+        sends = [r for r in self.server.requests if r["path"].endswith("/send-message")]
+        self.assertEqual(len(sends), 1)
+        self.assertEqual(sends[0]["body"], {"content": [{"type": "text", "text": "hello agent"}], "run": True})
+        self.assertEqual(self.header(sends[0]["headers"], "Authorization"), "Bearer k")
+
+    def test_resumes_a_paused_sandbox_before_sending(self) -> None:
+        import bridge as m
+
+        # PAUSED on the first lookup, RUNNING afterwards.
+        calls = {"n": 0}
+
+        def record(e):
+            calls["n"] += 1
+            state = "PAUSED" if calls["n"] == 1 else "RUNNING"
+            return 200, [{"sandbox_status": state, "sandbox_id": "SB1"}]
+
+        self.server.responders["/api/v1/app-conversations?ids=conv-1"] = record
+        self.server.responders["/api/v1/sandboxes/SB1/resume"] = lambda e: (200, {})
+        self.server.responders["/api/v1/app-conversations/conv-1/send-message"] = lambda e: (200, {})
+        m.CloudBackend(self.config()).send("conv-1", "hi")
+
+        resumed = [r for r in self.server.requests if "resume" in r["path"]]
+        self.assertEqual(len(resumed), 1, "a paused sandbox must be resumed")
+        self.assertTrue(any(r["path"].endswith("/send-message") for r in self.server.requests))
+
+    def test_retries_once_on_409(self) -> None:
+        import bridge as m
+
+        self.server.responders["/api/v1/app-conversations?ids=conv-1"] = self._running
+        attempts = {"n": 0}
+
+        def send(e):
+            attempts["n"] += 1
+            return (409, {"detail": "not running"}) if attempts["n"] == 1 else (200, {})
+
+        self.server.responders["/api/v1/app-conversations/conv-1/send-message"] = send
+        m.CloudBackend(self.config()).send("conv-1", "hi")
+        self.assertEqual(attempts["n"], 2)
+
+    def test_a_real_failure_is_raised_not_swallowed(self) -> None:
+        import bridge as m
+
+        self.server.responders["/api/v1/app-conversations?ids=conv-1"] = self._running
+        self.server.responders["/api/v1/app-conversations/conv-1/send-message"] = lambda e: (500, {"detail": "boom"})
+        with self.assertRaises(m.HttpError) as caught:
+            m.CloudBackend(self.config()).send("conv-1", "hi")
+        self.assertEqual(caught.exception.status, 500)
+
+
 class TestStatePersistence(unittest.TestCase):
     def test_roundtrip(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

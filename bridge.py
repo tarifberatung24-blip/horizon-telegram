@@ -163,24 +163,36 @@ def is_authorized(user_id: Any, allowed: frozenset[int]) -> bool:
 # --------------------------------------------------------------------------- #
 
 
-def post_json(url: str, payload: dict[str, Any], headers: dict[str, str], timeout: int = HTTP_TIMEOUT_SECONDS) -> dict[str, Any]:
-    body = json.dumps(payload).encode("utf-8")
-    request = urllib.request.Request(url, data=body, method="POST")
-    request.add_header("Content-Type", "application/json")
+class HttpError(RuntimeError):
+    """An HTTP failure with the status code kept, so callers can react to it."""
+
+    def __init__(self, status: int, url: str, body: str = ""):
+        self.status = status
+        self.url = url
+        self.body = body
+        super().__init__(f"HTTP {status} for {url}: {body[:200]}")
+
+
+def _request(url: str, headers: dict[str, str], *, data: bytes | None = None, timeout: int = HTTP_TIMEOUT_SECONDS) -> Any:
+    request = urllib.request.Request(url, data=data, method="POST" if data is not None else "GET")
+    if data is not None:
+        request.add_header("Content-Type", "application/json")
     for key, value in headers.items():
         request.add_header(key, value)
-    with urllib.request.urlopen(request, timeout=timeout) as response:
-        raw = response.read().decode("utf-8")
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            raw = response.read().decode("utf-8")
+    except urllib.error.HTTPError as exc:
+        raise HttpError(exc.code, url, exc.read().decode("utf-8", "replace")) from exc
     return json.loads(raw) if raw else {}
 
 
-def get_json(url: str, headers: dict[str, str], timeout: int = HTTP_TIMEOUT_SECONDS) -> dict[str, Any]:
-    request = urllib.request.Request(url, method="GET")
-    for key, value in headers.items():
-        request.add_header(key, value)
-    with urllib.request.urlopen(request, timeout=timeout) as response:
-        raw = response.read().decode("utf-8")
-    return json.loads(raw) if raw else {}
+def post_json(url: str, payload: dict[str, Any], headers: dict[str, str], timeout: int = HTTP_TIMEOUT_SECONDS) -> Any:
+    return _request(url, headers, data=json.dumps(payload).encode("utf-8"), timeout=timeout)
+
+
+def get_json(url: str, headers: dict[str, str], timeout: int = HTTP_TIMEOUT_SECONDS) -> Any:
+    return _request(url, headers, timeout=timeout)
 
 
 # --------------------------------------------------------------------------- #
@@ -301,19 +313,56 @@ class CloudBackend(Backend):
             time.sleep(2)
         raise RuntimeError("timed out waiting for the sandbox to start")
 
-    def send(self, conversation_id: str, text: str) -> None:
-        post_json(
-            f"{self._config.cloud_base_url}/api/v1/app-conversations/{conversation_id}/send-message",
-            {"content": [{"type": "text", "text": text}], "run": True},
-            self._headers(),
+    def _record(self, conversation_id: str) -> dict[str, Any]:
+        return first_record(
+            get_json(
+                f"{self._config.cloud_base_url}/api/v1/app-conversations?ids={conversation_id}",
+                self._headers(),
+            )
         )
 
+    def _wait_until_running(self, conversation_id: str, deadline_seconds: int = 120) -> bool:
+        """Resume the sandbox if it is paused and wait for RUNNING.
+
+        send-message returns 409 while the sandbox is PAUSED or STARTING, and the
+        message is lost, so this is checked before every send.
+        """
+        record = self._record(conversation_id)
+        if record.get("sandbox_status") == "RUNNING":
+            return True
+        sandbox_id = record.get("sandbox_id")
+        if not sandbox_id:
+            return False
+        try:
+            post_json(
+                f"{self._config.cloud_base_url}/api/v1/sandboxes/{sandbox_id}/resume",
+                {},
+                self._headers(),
+            )
+        except HttpError:
+            pass  # already resuming, or resume not needed; the poll below decides
+        deadline = time.time() + deadline_seconds
+        while time.time() < deadline:
+            if self._record(conversation_id).get("sandbox_status") == "RUNNING":
+                return True
+            time.sleep(2)
+        return False
+
+    def send(self, conversation_id: str, text: str) -> None:
+        self._wait_until_running(conversation_id)
+        payload = {"content": [{"type": "text", "text": text}], "run": True}
+        url = f"{self._config.cloud_base_url}/api/v1/app-conversations/{conversation_id}/send-message"
+        try:
+            post_json(url, payload, self._headers())
+        except HttpError as exc:
+            # One retry: the sandbox may have started between the check and the send.
+            if exc.status != 409:
+                raise
+            self._wait_until_running(conversation_id)
+            post_json(url, payload, self._headers())
+
     def status(self, conversation_id: str) -> str:
-        record = get_json(
-            f"{self._config.cloud_base_url}/api/v1/app-conversations?ids={conversation_id}",
-            self._headers(),
-        )
-        item = first_record(record)
+        item = self._record(conversation_id)
         return f"{item.get('sandbox_status', '?')} / {item.get('execution_status', '?')}"
 
     def fetch_events(self, conversation_id: str, limit: int = 50) -> list[dict[str, Any]]:
